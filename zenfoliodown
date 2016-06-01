@@ -1,5 +1,6 @@
 #!/usr/bin/env perl
 # Copyright 2012 Kevin Spencer <kevin@kevinspencer.org>
+# Auth code and some refactoring <mitch@monger.net>
 #
 # Permission to use, copy, modify, distribute, and sell this software and its
 # documentation for any purpose is hereby granted without fee, provided that
@@ -18,70 +19,132 @@ use XML::Simple;
 use strict;
 use warnings;
 
-our $VERSION = 0.5;
+our $VERSION = 0.6;
 
-my ($site, $album);
-GetOptions("site=s" => \$site, "album=s" => \$album);
+my ($site, $album, $key);
+GetOptions("site=s" => \$site, "album=s" => \$album, "key=s" => \$key);
 
 if ((! $album) || (! $site)) {
-    print "USAGE: $0 --site=example.zenfolio.com --album=album\n";
+    print "USAGE: $0 --site=example.zenfolio.com --album=album --key=key\n";
     exit();
 }
-mkdir($album) || die "Could not create $album - $!\n" if (! -d $album);
-
-my $bot = LWP::UserAgent->new();
-$bot->agent("zenfoliodown/$VERSION");
-my $api_url = 'http://www.zenfolio.com/api/1.6/zfapi.asmx';
 
 # remove leading p if album follows usual zenfolio convention of p123456789
 $album =~ s/^p// if ($album =~ /\b^p\d+\b/);
-my $album_id = $album;
-# if album_id still non numeric, call the ResolveReference API method to find integer album id
-if ($album_id =~ /\D/) {
-    $site =~ s/\.zenfolio\.com//;
-    my $url = $api_url . '/' . 'ResolveReference' . "?loginName=$site" . "&reference=$album_id";
-    my $response = $bot->get($url);
-    if ($response->is_success()) {
-        if (! response_is_xml($response->content())) {
-            die "Response from $url is not valid.\n";
-        }
-        my $xs = XML::Simple->new();
-        my $data = $xs->XMLin($response->content());
-        $album_id = $data->{PhotoSet}{Id};
-    }
-}
-my $url = $api_url . '/' . 'LoadPhotoSetPhotos' . '?photoSetId=' . $album_id . '&startingIndex=0&numberOfPhotos=1000';
 
-my $response = $bot->get($url);
-$bot->show_progress(1);
-if ($response->is_success()) {
-    if (! response_is_xml($response->content())) {
-        die "Response from $url is not valid.\n";
+# And we need to store the output...
+mkdir($album) || die "Could not create $album - $!\n" if (! -d $album);
+my $album_id = $album;
+
+# Start the network stuff!!
+
+my $ua = LWP::UserAgent->new();
+$ua->cookie_jar( {} );
+$ua->agent("zenfoliodown/$VERSION");
+
+
+my $api_url = 'http://'.$site.'/api/1.7/zfapi.asmx';
+
+#First we need the authtoken.  We need this to get the photoset in the folder
+my $token = get_token($api_url, $ua);
+$ua->default_header('X-Zenfolio-Token' => $token);
+
+
+# Photoset gets us a list of URLs, as well as a realmid
+my ($realmid, $urllist) = get_photoset($api_url, $ua, $album_id);
+
+
+#Now let's get a keyring (using that realmid).
+#We seem to need the keyring to download the piks themselves.  I'd think
+#that the authtoken would be enough... but it doesn't seem to work...
+
+my $keyring = get_keyring($api_url, $ua, $realmid);
+$ua->default_header('X-Zenfolio-Keyring' => $keyring);
+
+
+# Now, finally... we do the downloads!!
+PHOTO: for my $origurl (@$urllist) {
+    my $downloaded_file = $album.'/'.basename($origurl);
+    if (-e $downloaded_file) {
+        print "Already downloaded $origurl, skipping.\n";
+        next PHOTO;
     }
+    for my $attempt (1..3) {
+        my $response = $ua->get($origurl, 
+                                ':content_file' => $downloaded_file);
+        next PHOTO if ($response->is_success() && -e $downloaded_file);
+    }
+    # If we get here... We failed
+    my $miss_log = $album . '/' . $album . '_miss.log';
+    open(my $fh, '>>', $miss_log) || die "Could not append $miss_log - $!\n";
+    print $fh $origurl, "\n";
+    close($fh);
+}
+
+
+
+
+
+1;
+
+####################################
+
+sub get_token {
+  my ($api_url, $ua) = @_;
+
+  my $token;
+  my $response = $ua->get($api_url."/AuthenticateVisitor?visitorKey=".$key);
+  if ($response->is_success()) {
+    die "Response from $api_url is not valid.\n" unless response_is_xml($response->content());
+
     my $xs = XML::Simple->new();
     my $data = $xs->XMLin($response->content());
-    if (! $data->{Photo}) {
-        die "Response from $url is not valid.\n";
-    }
+    $token = $data->{content};
+  }
+  return $token;
+} 
+
+sub get_photoset {
+  my ($api_url, $ua, $album_id) = @_;
+
+  my $realmid = '';
+  my @urllist;
+
+  my $url = $api_url.'/LoadPhotoSetPhotos?photoSetId='.$album_id
+                    .'&startingIndex=0&numberOfPhotos=1000';
+
+  my $response = $ua->get($url);
+  $ua->show_progress(1);
+  if ($response->is_success()) {
+    die "Response from $url is not valid.\n" unless response_is_xml($response->content());
+
+    my $xs = XML::Simple->new();
+    my $data = $xs->XMLin($response->content());
+    die "Response from $url is not valid.\n" unless $data->{Photo};
+
     for my $photo (@{$data->{Photo}}) {
-        my $downloaded_file = $album . '/' . basename($photo->{OriginalUrl});
-        if (-e $downloaded_file) {
-            print "Already downloaded $photo->{OriginalUrl}, skipping.\n";
-            next;
-        }
-        for my $attempt (1..3) {
-            my $response = $bot->get($photo->{OriginalUrl}, ':content_file' => $downloaded_file);
-            last if ($response->is_success() && -e $downloaded_file);
-            if ($attempt == 3) {
-                my $miss_log = $album . '/' . $album . '_miss.log';
-                open(my $fh, '>>', $miss_log) || die "Could not append $miss_log - $!\n";
-                print $fh $photo->{OriginalUrl}, "\n";
-                close($fh);
-            }
-        }
+      $realmid ||= $photo->{AccessDescriptor}{RealmId};
+      push @urllist, $photo->{OriginalUrl};
     }
-} else {
-    print $response->status_line(), "\n";
+  }
+
+  return ($realmid, \@urllist);
+}
+
+sub get_keyring {
+  my ($api_url, $ua, $realmid) = @_;
+
+  my $keyring;
+  my $response = $ua->get($api_url.'/KeyringAddKeyPlain?keyring=&realmId='
+                                  .$realmid.'&password='.$key);
+  if ($response->is_success()) {
+    die "Response from $api_url is not valid.\n" unless response_is_xml($response->content());
+
+    my $xs = XML::Simple->new();
+    my $data = $xs->XMLin($response->content());
+    $keyring = $data->{content};
+  }
+  return $keyring;
 }
 
 sub response_is_xml {
